@@ -1,0 +1,24 @@
+# Makefile for fun_idpool memory analysis
+CC      ?= gcc
+CFLAGS  ?= -O3 -std=c99 -Wall -Wextra -Wno-unused-parameter
+LDFLAGS ?= -lpthread
+
+SRC_POOL  = fun_idpool.c
+SRC_ARCH  = arch_defs.h
+HDR_POOL  = fun_idpool.h
+SRC_TEST  = test_mem.c
+
+BIN = test_mem
+
+all: $(BIN)
+
+$(BIN): $(SRC_TEST) $(SRC_POOL) $(SRC_ARCH) $(HDR_POOL)
+	$(CC) $(CFLAGS) $(SRC_TEST) $(SRC_POOL) -o $(BIN) $(LDFLAGS)
+
+run: $(BIN)
+	./$(BIN) 2>&1 | tee mem_raw.txt
+
+clean:
+	rm -f $(BIN) mem_raw.txt
+
+.PHONY: all run clean
