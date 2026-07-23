@@ -10,6 +10,7 @@ test_bit0_asan
 verify_bit0
 verify_bit0_dbg
 verify_bit0_asan
+test_v8
 
 # 测试数据/快照
 mem_raw.txt
