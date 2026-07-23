@@ -1,0 +1,31 @@
+# 编译产物
+test_idpool
+test_idpool_dbg
+test_idpool_asan
+
+# 通用
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+
+# 编辑器/IDE
+*.swp
+*.swo
+.vscode/
+.idea/
+*.iml
+*.user
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 调试/分析
+*.dSYM/
+*.core
+core.*
+vgcore.*
