@@ -12,14 +12,14 @@
 /* ============================================================
  * 1. Cache line size — 平台自适应
  *
- * 用于:
- *   - CACHE_ALIGN:  结构体对齐到 cache line 边界, 避免 false sharing
- *   - a_alloc:      分配 cache line 对齐的内存
- *
  * 各平台字节数:
  *   x86_64 / AArch64 / LoongArch64: 64 字节
  *   x86_32 / ARMv7:                 32 字节
  *   其他:                           默认 64 字节
+ *
+ * 用于:
+ *   - CACHE_ALIGN:  结构体对齐到 cache line (避免 false sharing)
+ *   - a_alloc:      分配 cache line 对齐的内存
  * ============================================================ */
 #if defined(__x86_64__) || defined(__aarch64__) || defined(__loongarch__)
     #define CACHE_LINE_SIZE 64
@@ -54,12 +54,12 @@
  *
  * 设计原则:
  *   - 统一使用 GCC __atomic_* 内建, 跨平台、跨位宽
- *   - ACQUIRE 语义: 读屏障, 看到其他线程 ACQUIRE/RELEASE 之前的写
- *   - RELEASE 语义: 写屏障, 本线程的写在其他线程 ACQUIRE 之前可见
- *   - ACQ_REL:    读+写屏障, 用于 fetch_add / cas 等 RMW 操作
+ *   - ACQUIRE: 读屏障, 看到其他线程 ACQUIRE/RELEASE 之前的写
+ *   - RELEASE: 写屏障, 本线程的写在其他线程 ACQUIRE 之前可见
+ *   - ACQ_REL: 读+写屏障, 用于 fetch_add / cas 等 RMW 操作
  *
  * 内存序:
- *   - a_load32/64: ACQUIRE (用于读 stats / cursor / bitmap)
+ *   - a_load32/64:  ACQUIRE (用于读 stats / cursor / bitmap)
  *   - a_store32/64: RELEASE (用于写 alloced / state / version)
  *   - a_fadd32/64:  ACQ_REL (用于 total_alloc / used / cursor 推进)
  *   - a_cas32:      ACQ_REL (用于 region_count 原子推进)
@@ -67,7 +67,7 @@
  *   - a_fand64:     ACQ_REL (用于 global_bm 清位)
  * ============================================================ */
 
-/* 32-bit 操作: 用于 stats / cursor / region_count (轻量计数器) */
+/* 32-bit 操作: 用于 stats / cursor / region_count 等轻量计数器 */
 static inline uint32_t a_load32(uint32_t *p) {
     return __atomic_load_n(p, __ATOMIC_ACQUIRE);
 }
@@ -108,8 +108,8 @@ static inline uint64_t a_fadd64(uint64_t *p, uint64_t v) {
 /* ============================================================
  * 4. 对齐内存分配
  *
- * a_alloc:   cache line 对齐分配 (用于 Zone / Region 等大结构体)
- * a_alloc8:  8 字节对齐分配 (用于 uint64_t 数组, ARMv7 LDREXD 要求)
+ * a_alloc:  cache line 对齐分配 (用于 Zone / Region 等大结构体)
+ * a_alloc8: 8 字节对齐分配 (用于 uint64_t 数组, ARMv7 LDREXD 要求)
  *
  * 失败处理: posix_memalign 失败直接 abort (永不返回 NULL)
  * 初始化:   分配后自动 memset 0

@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 /* ============================================================
- * fun_idpool — 无锁 ID 池 (v8: 柔性数组 + 动态 slots)
+ * fun_idpool — 无锁 ID 池 (v9: Zone 数量无限制)
  *
  * 特性：
  *   - 严格 C99, 零依赖 (仅 POSIX + GCC 内建原子)
@@ -14,8 +14,8 @@
  *   - Region #0 bit 0 保留 (ID 0 = FUN_IDPOOL_INVALID_ID 永不分配)
  *   - Region 内 ID 单调递增, 耗尽后才复用
  *   - 懒加载: bitmap / values / slots / registry 全部按需分配
- *   - 动态 zones (柔性数组, 精确 numa_nodes 内存)
- *   - 动态 slots (初始 SLOT_INIT_CAP = 4, 2 倍扩容)
+ *   - 动态 zones (柔性数组, 精确 numa_nodes 内存, 无硬编码上限)
+ *   - Zone 数量无限制 (安全上限 1024, 运算对齐 2 的幂)
  *   - Zone 属性重排 (热数据 / 统计 / 全局位图 / 动态数组, 独立 cache line)
  *   - 双模式: WITH_VALUE / NO_VALUE
  *   - INIT_CAP = 64 (Region #0 可用 63 个 ID, bit 0 保留)
@@ -71,7 +71,7 @@ typedef struct fun_idpool_stats_s fun_idpool_stats_s, *fun_idpool_stats_t;
 /* 创建 ID 池 (默认 WITH_VALUE 模式)
  *
  * 参数:
- *   numa_nodes: NUMA zone 数量 (0 = 自动检测, 上限 16)
+ *   numa_nodes: NUMA zone 数量 (0 = 自动检测, 安全上限 1024)
  *               自动检测从 /sys/devices/system/node/online 读取
  *               或用 sysconf(_SC_NPROCESSORS_ONLN) 估算
  *
@@ -89,7 +89,7 @@ fun_idpool_t fun_idpool_create(int numa_nodes);
 /* 创建 ID 池 (指定模式)
  *
  * 参数:
- *   numa_nodes: NUMA zone 数量 (0 = 自动检测, 上限 16)
+ *   numa_nodes: NUMA zone 数量 (0 = 自动检测, 安全上限 1024)
  *   mode:       FUN_IDPOOL_MODE_WITH_VALUE 或 FUN_IDPOOL_MODE_NO_VALUE
  *
  * 返回:

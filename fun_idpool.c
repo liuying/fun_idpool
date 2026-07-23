@@ -156,7 +156,7 @@ static inline void slot_load(region_slot *s, uint32_t *idx, uint32_t *ver) {
 #endif
 
 /* ============================================================
- * 容量 / Base 公式
+ * 容量 / Base 公式 (不变)
  *   cap(k)   = INIT_CAP * 2^k  (钳制到 MAX_CAP)
  *   base(k)  = INIT_CAP * (2^k - 1)
  * ============================================================ */
@@ -263,7 +263,7 @@ static inline void upd_summary(uint64_t *sum, uint64_t *main_bm,
  * Zone 动态数组: slot / registry 懒加载 + 扩容
  *
  * 设计要点:
- *   - slots: region_slot 动态数组, 初始 SLOT_INIT_CAP = 4
+ *   - slots:   region_slot 动态数组, 初始 SLOT_INIT_CAP = 4
  *   - regions: region 指针动态数组, 初始 SLOT_INIT_CAP = 4
  *   - 扩容策略: 2 倍增长, 上限 MAX_REGIONS
  *   - 旧数组进入 old_arrays 列表延迟释放, 避免正在读的线程踩空
@@ -671,7 +671,8 @@ static uint32_t zone_alloc(idpool_zone *z, uint32_t node_id, void *v) {
 fun_idpool_t fun_idpool_create_ex(int numa_nodes, fun_idpool_mode_t mode) {
     int detected = detect_numa_nodes();
     if (numa_nodes <= 0) numa_nodes = detected;
-    if (numa_nodes > 16) numa_nodes = 16;
+    /* 安全上限: 1024 个 Zone (足够任何实际系统, 同时防止异常值) */
+    if (numa_nodes > 1024) numa_nodes = 1024;
     if (numa_nodes < 1) numa_nodes = 1;
 
     int aligned = 1;
