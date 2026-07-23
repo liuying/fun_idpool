@@ -30,25 +30,39 @@
 #define MAX_RETRY 3
 
 /* ============================================================
- * Region 结构体 (缓存友好布局)
+ * Region 结构体 — 双模式统一
+ *
+ * 设计:
+ *   - bitmap 永远存在 (分配/释放/查询都依赖它)
+ *   - values 在 NO_VALUE 模式下为 NULL (永远不分配)
+ *   - WITH_VALUE 模式下 values 正常分配
+ *   - 通过 pool->mode 区分行为
+ *
+ * 内存布局 (NO_VALUE, 1M ID):
+ *   bitmap:  ~128 KB  (1M bits / 8)
+ *   summary: ~2 KB
+ *   values:  0
+ *   → 比 WITH_VALUE 省 ~8 MB (1M × 8 B 指针)
  * ============================================================ */
 typedef struct idpool_region {
     /* ---- Cache Line 0: 热数据 ---- */
     uint32_t base;           /* Region 起始 ID (publish 后只读) */
-    uint32_t cap;             /* Region 容量 (publish 后只读) */
-    uint32_t used;            /* 已使用数 (原子) */
-    uint32_t cursor;          /* 分配游标 (原子) */
+    uint32_t cap;            /* Region 容量 (publish 后只读) */
+    uint32_t used;           /* 已使用数 (原子) */
+    uint32_t cursor;         /* 分配游标 (原子) */
 
     /* ---- Cache Line 1: 控制 ---- */
-    uint32_t alloced;         /* 内存是否已分配完成 (原子发布标志) */
-    uint32_t state;           /* 0=ACTIVE, 1=FULL, 2=RECYCLE */
-    uint32_t zone_id;         /* 所属 zone */
-    uint32_t region_idx;      /* 在 zone 中的索引 */
+    uint32_t alloced;        /* 内存是否已分配完成 (原子发布标志) */
+    uint32_t state;          /* 0=ACTIVE, 1=FULL, 2=RECYCLE */
+    uint32_t zone_id;        /* 所属 zone */
+    uint32_t region_idx;     /* 在 zone 中的索引 */
 
     /* ---- Cache Line 2+: 大块内存 (懒加载) ---- */
     uint64_t *bitmap  ALIGN_8;
     uint64_t *summary ALIGN_8;
     uint32_t summary_words;
+
+    /* values: NULL in NO_VALUE mode (不分配, 不访问) */
     void    **values;
 } idpool_region;
 
@@ -86,7 +100,8 @@ struct fun_idpool_s {
     uint32_t numa_nodes;      /* 实际节点数 (用于内存分配) */
     uint32_t zone_shift;      /* log2(对齐后的节点数) */
     uint32_t zone_mask;       /* 对齐后 - 1 */
-    uint32_t aligned_nodes;    /* 2 的幂 (用于位运算) */
+    uint32_t aligned_nodes;   /* 2 的幂 (用于位运算) */
+    uint32_t mode;            /* FUN_IDPOOL_MODE_* */
     idpool_zone *zones[16] CACHE_ALIGN;
 };
 
@@ -115,7 +130,7 @@ static inline uint32_t cap_of(uint32_t k) {
     uint32_t c = INIT_CAP;
     for (uint32_t i = 0; i < k && c < MAX_CAP; i++) {
         uint32_t next = c << 1;
-        if (next < c) { c = MAX_CAP; break; }  /* 溢出 */
+        if (next < c) { c = MAX_CAP; break; }
         c = next;
     }
     if (c > MAX_CAP) c = MAX_CAP;
@@ -127,7 +142,7 @@ static inline uint32_t base_of(uint32_t k) {
     uint32_t total = 0;
     for (uint32_t i = 0; i < k; i++) {
         uint32_t c = cap_of(i);
-        if (total + c < total) return 0xFFFFFFFFu;  /* 饱和 */
+        if (total + c < total) return 0xFFFFFFFFu;
         total += c;
     }
     return total;
@@ -211,25 +226,34 @@ static inline void upd_summary(uint64_t *sum, uint64_t *main_bm,
 
 /* ============================================================
  * Region 懒加载内存分配
- * 只有在第一次实际使用时才分配 bitmap/values
+ *
+ * 关键改动:
+ *   NO_VALUE 模式: 只分配 bitmap + summary, 不分配 values
+ *   WITH_VALUE 模式: 额外分配 values 数组
  * ============================================================ */
-static void ensure_region(idpool_region *r) {
+static void ensure_region(idpool_region *r, int mode) {
     if (a_load32(&r->alloced)) return;
 
     uint32_t cap = r->cap;
     uint32_t nw = (cap + 63) >> 6;
     uint32_t sw = (nw + 63) >> 6;
 
-    uint64_t *bm  = (uint64_t *)a_alloc8(nw * sizeof(uint64_t));
+    /* bitmap 必须分配 (两种模式都需要) */
+    uint64_t *bm = (uint64_t *)a_alloc8(nw * sizeof(uint64_t));
     if (!bm) abort();
 
+    /* summary 必须分配 */
     uint64_t *sum = (uint64_t *)a_alloc8(sw * sizeof(uint64_t));
     if (!sum) { free(bm); abort(); }
     /* summary 初始全 1 = 每个字都有空闲 */
     memset(sum, 0xFF, sw * sizeof(uint64_t));
 
-    void **vals = (void **)a_alloc(cap * sizeof(void *));
-    if (!vals) { free(bm); free(sum); abort(); }
+    /* values: 仅 WITH_VALUE 模式分配 */
+    void **vals = NULL;
+    if (mode == FUN_IDPOOL_MODE_WITH_VALUE) {
+        vals = (void **)a_alloc(cap * sizeof(void *));
+        if (!vals) { free(bm); free(sum); abort(); }
+    }
 
     /* CAS 发布 (只发布一次) */
     uint64_t *exp = NULL;
@@ -237,20 +261,20 @@ static void ensure_region(idpool_region *r) {
                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
         r->summary = sum;
         r->summary_words = sw;
-        r->values = vals;
+        r->values = vals;     /* NULL in NO_VALUE mode */
         a_store32(&r->alloced, 1);
     } else {
         /* 竞争失败: 别人抢先发布了 */
         free(bm);
         free(sum);
-        free(vals);
+        if (vals) free(vals);
     }
 }
 
 /* ============================================================
  * 创建新 Region (串行化 + 懒加载)
  * ============================================================ */
-static idpool_region *create_region(idpool_zone *z) {
+static idpool_region *create_region(idpool_zone *z, int mode) {
     uint32_t rc = a_load32(&z->region_count);
     for (;;) {
         if (rc >= MAX_REGIONS) {
@@ -280,8 +304,7 @@ static idpool_region *create_region(idpool_zone *z) {
             registry_publish(z->zone_id, k, r);
 
             /* 发布 slot (原子可见) */
-            uint32_t ver = k + 1;
-            slot_publish(&z->regions[k], k, ver);
+            slot_publish(&z->regions[k], k, (uint32_t)(k + 1));
 
             /* 标记 global bitmap */
             uint32_t gi = k >> 6, gb = k & 63;
@@ -289,8 +312,9 @@ static idpool_region *create_region(idpool_zone *z) {
                 a_for64(&z->global_bm[gi], 1ULL << gb);
 
             fprintf(stderr,
-                    "[fun_idpool] zone%d: new region #%u base=%u cap=%u\n",
-                    z->zone_id, k, base, cap);
+                    "[fun_idpool] zone%d: new region #%u base=%u cap=%u mode=%s\n",
+                    z->zone_id, k, base, cap,
+                    mode == FUN_IDPOOL_MODE_NO_VALUE ? "NO_VALUE" : "WITH_VALUE");
             return r;
         }
         rc = a_load32(&z->region_count);
@@ -307,9 +331,8 @@ static idpool_region *load_region(idpool_zone *z, uint32_t idx, uint64_t *ver_ou
     region_slot *s = &z->regions[idx];
     uint64_t packed = slot_load(s);
     if (packed == 0) { *ver_out = 0; return NULL; }
-    uint32_t s_idx = slot_idx(packed);
     *ver_out = slot_ver(packed);
-    return registry_load(z->zone_id, s_idx);
+    return registry_load(z->zone_id, slot_idx(packed));
 #else
     uint32_t s_idx = 0, s_ver = 0;
     slot_load(&z->regions[idx], &s_idx, &s_ver);
@@ -330,9 +353,14 @@ static idpool_region *load_region(idpool_zone *z, uint32_t idx, uint64_t *ver_ou
  *   - TAS 失败时不回退 cursor, 而是跳到下一个 word
  *   - cursor 只向前推进, 保证单调性
  *   - 使用 find_zero_from 的返回值 (保证 < cap)
+ *
+ * 两种模式共用同一路径:
+ *   NO_VALUE:  r->values 为 NULL, 不存 ptr
+ *   WITH_VALUE: r->values 正常存 ptr
  * ============================================================ */
-static uint32_t region_alloc(idpool_zone *z, idpool_region *r, uint32_t node_id, void *v) {
-    ensure_region(r);
+static uint32_t region_alloc(idpool_zone *z, idpool_region *r,
+                              uint32_t node_id, void *v, int mode) {
+    ensure_region(r, mode);
     if (!a_load32(&r->alloced)) return FUN_IDPOOL_INVALID_ID;
 
     uint32_t cap = r->cap;
@@ -366,8 +394,11 @@ static uint32_t region_alloc(idpool_zone *z, idpool_region *r, uint32_t node_id,
             /* 更新 summary */
             upd_summary(r->summary, bm, bit >> 6, nw);
 
-            /* 存储值 */
-            r->values[bit] = v;
+            /* 存储值 (仅 WITH_VALUE 模式) */
+            if (mode == FUN_IDPOOL_MODE_WITH_VALUE && r->values) {
+                r->values[bit] = v;
+            }
+
             a_fadd32(&r->used, 1);
             a_fadd64(&z->total_alloc, 1);
 
@@ -399,8 +430,14 @@ static uint32_t region_alloc(idpool_zone *z, idpool_region *r, uint32_t node_id,
         if (bit >= cap) break;  /* 真的全满了 */
 
         if (!bit_tas(bm, bit)) {
+            /* 更新 summary */
             upd_summary(r->summary, bm, bit >> 6, nw);
-            r->values[bit] = v;
+
+            /* 存储值 (仅 WITH_VALUE 模式) */
+            if (mode == FUN_IDPOOL_MODE_WITH_VALUE && r->values) {
+                r->values[bit] = v;
+            }
+
             a_fadd32(&r->used, 1);
             a_fadd64(&z->total_alloc, 1);
             a_fadd64(&z->reuse_count, 1);
@@ -424,7 +461,7 @@ static uint32_t region_alloc(idpool_zone *z, idpool_region *r, uint32_t node_id,
  *   2. 利用 global_bm 快速跳过 FULL 的
  *   3. 全部满了才创建新 Region
  * ============================================================ */
-static uint32_t zone_alloc(idpool_zone *z, uint32_t node_id, void *v) {
+static uint32_t zone_alloc(idpool_zone *z, uint32_t node_id, void *v, int mode) {
     uint32_t rc = a_load32(&z->region_count);
 
     /* 遍历已有 Region (从 0 开始, 优先复用旧 Region 的空闲位) */
@@ -452,7 +489,7 @@ static uint32_t zone_alloc(idpool_zone *z, uint32_t node_id, void *v) {
                 continue;
             }
 
-            uint32_t id = region_alloc(z, r, node_id, v);
+            uint32_t id = region_alloc(z, r, node_id, v, mode);
             if (id != FUN_IDPOOL_INVALID_ID) return id;
 
             /* region_alloc 失败, 可能刚满, 再检查一次 */
@@ -464,9 +501,9 @@ static uint32_t zone_alloc(idpool_zone *z, uint32_t node_id, void *v) {
     }
 
     /* 所有 Region 都满了, 创建新的 */
-    idpool_region *nr = create_region(z);
+    idpool_region *nr = create_region(z, mode);
     if (nr) {
-        uint32_t id = region_alloc(z, nr, node_id, v);
+        uint32_t id = region_alloc(z, nr, node_id, v, mode);
         if (id != FUN_IDPOOL_INVALID_ID) return id;
     }
 
@@ -482,7 +519,7 @@ static uint32_t zone_alloc(idpool_zone *z, uint32_t node_id, void *v) {
             uint64_t ver;
             idpool_region *r = load_region(z, i, &ver);
             if (!r) continue;
-            uint32_t id = region_alloc(z, r, node_id, v);
+            uint32_t id = region_alloc(z, r, node_id, v, mode);
             if (id != FUN_IDPOOL_INVALID_ID) return id;
         }
         /* 让出 CPU, 等待其他线程释放 */
@@ -491,10 +528,19 @@ static uint32_t zone_alloc(idpool_zone *z, uint32_t node_id, void *v) {
 }
 
 /* ============================================================
- * 公开 API
+ * 公开 API — 实现
  * ============================================================ */
 
 fun_idpool_t fun_idpool_create(int numa_nodes) {
+    return fun_idpool_create_ex(numa_nodes, FUN_IDPOOL_MODE_WITH_VALUE);
+}
+
+fun_idpool_t fun_idpool_create_ex(int numa_nodes, int mode) {
+    /* 验证 mode */
+    if (mode != FUN_IDPOOL_MODE_WITH_VALUE && mode != FUN_IDPOOL_MODE_NO_VALUE) {
+        mode = FUN_IDPOOL_MODE_WITH_VALUE;  /* 安全默认 */
+    }
+
     /* 检测实际 NUMA 节点数 */
     int detected = detect_numa_nodes();
     if (numa_nodes <= 0) {
@@ -512,10 +558,11 @@ fun_idpool_t fun_idpool_create(int numa_nodes) {
 
     fun_idpool_t pool = (fun_idpool_t)a_alloc(sizeof(fun_idpool_s));
     if (!pool) abort();
-    pool->numa_nodes   = actual;
+    pool->numa_nodes    = actual;
     pool->aligned_nodes = aligned;
-    pool->zone_shift   = __builtin_ctz(aligned);
-    pool->zone_mask    = aligned - 1;
+    pool->zone_shift    = __builtin_ctz(aligned);
+    pool->zone_mask     = aligned - 1;
+    pool->mode          = mode;
 
     for (int n = 0; n < actual; n++) {
         idpool_zone *z = (idpool_zone *)a_alloc(sizeof(idpool_zone));
@@ -538,7 +585,6 @@ fun_idpool_t fun_idpool_create(int numa_nodes) {
 
         registry_publish(n, 0, r0);
         slot_publish(&z->regions[0], 0, 1);
-
         z->region_count = 1;
         /* global_bm[0] 的 bit 0 标记 Region #0 可用 */
         a_for64(&z->global_bm[0], 1ULL);
@@ -546,8 +592,9 @@ fun_idpool_t fun_idpool_create(int numa_nodes) {
         pool->zones[n] = z;
     }
 
-    fprintf(stderr, "[fun_idpool] created: %d zones (detected=%d, aligned=%d)\n",
-            actual, detected, aligned);
+    fprintf(stderr, "[fun_idpool] created: %d zones (detected=%d, aligned=%d, mode=%s)\n",
+            actual, detected, aligned,
+            (mode == FUN_IDPOOL_MODE_NO_VALUE) ? "NO_VALUE" : "WITH_VALUE");
     return pool;
 }
 
@@ -577,7 +624,7 @@ uint32_t fun_idpool_gen_id(fun_idpool_t pool, void *ptr) {
     if (n >= pool->numa_nodes) n = cpu % pool->numa_nodes;
 
     idpool_zone *z = pool->zones[n];
-    return zone_alloc(z, n, ptr);
+    return zone_alloc(z, n, ptr, pool->mode);
 }
 
 void *fun_idpool_get_value(fun_idpool_t pool, uint32_t id) {
@@ -589,6 +636,7 @@ void *fun_idpool_get_value(fun_idpool_t pool, uint32_t id) {
 
     idpool_zone *z = pool->zones[n];
     uint32_t rc = a_load32(&z->region_count);
+    int mode = pool->mode;
 
     for (uint32_t i = 0; i < rc; i++) {
         uint64_t ver;
@@ -597,12 +645,19 @@ void *fun_idpool_get_value(fun_idpool_t pool, uint32_t id) {
         if (idx >= r->base && idx < r->base + r->cap) {
             uint32_t off = idx - r->base;
             if (off < r->cap && bit_test(r->bitmap, off)) {
-                return r->values[off];
+                /* ID 存在 */
+                if (mode == FUN_IDPOOL_MODE_WITH_VALUE) {
+                    /* 返回绑定的指针 (可能为 NULL) */
+                    return (r->values) ? r->values[off] : NULL;
+                } else {
+                    /* NO_VALUE: 返回哨兵 FUN_IDPOOL_EXISTS */
+                    return FUN_IDPOOL_EXISTS;  /* (void *)1 */
+                }
             }
-            break;  /* idx 属于这个 Region 但不命中 */
+            break;
         }
     }
-    return NULL;
+    return NULL;  /* ID 不存在 */
 }
 
 void *fun_idpool_release_id(fun_idpool_t pool, uint32_t id) {
@@ -614,6 +669,7 @@ void *fun_idpool_release_id(fun_idpool_t pool, uint32_t id) {
 
     idpool_zone *z = pool->zones[n];
     uint32_t rc = a_load32(&z->region_count);
+    int mode = pool->mode;
 
     for (uint32_t i = 0; i < rc; i++) {
         uint64_t ver;
@@ -622,25 +678,31 @@ void *fun_idpool_release_id(fun_idpool_t pool, uint32_t id) {
         if (idx >= r->base && idx < r->base + r->cap) {
             uint32_t off = idx - r->base;
             if (off < r->cap && bit_test(r->bitmap, off)) {
-                void *v = r->values[off];
-                r->values[off] = NULL;
+                void *old_val = NULL;
+
+                if (mode == FUN_IDPOOL_MODE_WITH_VALUE && r->values) {
+                    old_val = r->values[off];
+                    r->values[off] = NULL;
+                } else {
+                    /* NO_VALUE: 返回 FUN_IDPOOL_EXISTS 表示"成功释放" */
+                    old_val = FUN_IDPOOL_EXISTS;
+                }
+
                 bit_clear(r->bitmap, off);
                 a_fadd32(&r->used, -1);
                 a_fadd64(&z->total_freed, 1);
 
-                /* 更新 summary */
                 upd_summary(r->summary, r->bitmap, off >> 6,
                             (r->cap + 63) >> 6);
 
-                /* Region 不再是 FULL */
                 if (a_load32(&r->state) == 1) {
-                    a_store32(&r->state, 0);  /* ACTIVE */
+                    a_store32(&r->state, 0);
                     uint32_t gi = i >> 6, gb = i & 63;
                     if (gi < GLOBAL_BMW)
                         a_for64(&z->global_bm[gi], 1ULL << gb);
                 }
 
-                return v;
+                return old_val;
             }
             return NULL;
         }
@@ -651,6 +713,8 @@ void *fun_idpool_release_id(fun_idpool_t pool, uint32_t id) {
 void fun_idpool_get_stats(fun_idpool_t pool, fun_idpool_stats_t stats) {
     memset(stats, 0, sizeof(*stats));
     stats->numa_nodes = pool->numa_nodes;
+    stats->mode = pool->mode;
+
     for (uint32_t n = 0; n < pool->numa_nodes; n++) {
         idpool_zone *z = pool->zones[n];
         stats->total_alloc   += a_load64(&z->total_alloc);
@@ -659,4 +723,28 @@ void fun_idpool_get_stats(fun_idpool_t pool, fun_idpool_stats_t stats) {
         stats->reuse_count   += a_load64(&z->reuse_count);
         stats->total_regions += a_load32(&z->region_count);
     }
+
+    /* 精确计算内存占用 */
+    for (uint32_t n = 0; n < pool->numa_nodes; n++) {
+        idpool_zone *z = pool->zones[n];
+        uint32_t rc = a_load32(&z->region_count);
+        for (uint32_t i = 0; i < rc; i++) {
+            idpool_region *r = registry_load(n, i);
+            if (!r || !a_load32(&r->alloced)) continue;
+
+            uint32_t nw = (r->cap + 63) >> 6;
+            uint32_t sw = (nw + 63) >> 6;
+
+            stats->bitmap_memory += nw * sizeof(uint64_t);   /* bitmap */
+            stats->bitmap_memory += sw * sizeof(uint64_t);   /* summary */
+
+            if (pool->mode == FUN_IDPOOL_MODE_WITH_VALUE) {
+                stats->values_memory += r->cap * sizeof(void *);
+            }
+        }
+    }
+}
+
+int fun_idpool_get_mode(fun_idpool_t pool) {
+    return pool ? (int)pool->mode : FUN_IDPOOL_MODE_WITH_VALUE;
 }
