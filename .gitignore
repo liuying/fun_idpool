@@ -2,6 +2,8 @@
 test_idpool
 test_idpool_dbg
 test_idpool_asan
+test_mem
+test_memopt
 
 # 通用
 *.o
