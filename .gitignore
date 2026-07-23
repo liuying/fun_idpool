@@ -1,18 +1,9 @@
-# 编译产物
+# 编译产物 (主 Makefile + Makefile.mem + Makefile.memopt)
 test_mem
 test_memopt
-test_split
-test_split_dbg
-test_split_asan
-test_bit0
-test_bit0_dbg
-test_bit0_asan
-verify_bit0
-verify_bit0_dbg
-verify_bit0_asan
-test_v8
+test_v9
 
-# 测试数据/快照
+# 测试数据/快照 (Makefile.mem 仍会生成)
 mem_raw.txt
 
 # 通用
