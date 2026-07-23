@@ -3,6 +3,14 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdarg.h>
 
 /* ============================================================
  * 1. Cache line size — 平台自适应
@@ -30,10 +38,7 @@
 
 /* ============================================================
  * 3. 原子操作包装
- *    统一使用 __atomic_* 内建，跨平台、跨位宽
  * ============================================================ */
-
-/* 32-bit load/store/add */
 static inline uint32_t a_load32(uint32_t *p) {
     return __atomic_load_n(p, __ATOMIC_ACQUIRE);
 }
@@ -48,7 +53,6 @@ static inline int a_cas32(uint32_t *p, uint32_t *exp, uint32_t new) {
                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 }
 
-/* 64-bit load/store/add (用于 bitmap 字 + 统计计数器) */
 static inline uint64_t a_load64(uint64_t *p) {
     return __atomic_load_n(p, __ATOMIC_ACQUIRE);
 }
@@ -67,36 +71,26 @@ static inline uint64_t a_fadd64(uint64_t *p, uint64_t v) {
 
 /* ============================================================
  * 4. Region Slot — 平台自适应
- *
- * 64-bit: packed = [version:32][idx:32]  一次原子读
- * 32-bit:  idx + version 分两个 cache-line 隔离的 32-bit 变量
  * ============================================================ */
-
 #if ARCH_64BIT
-
 typedef struct CACHE_ALIGN {
-    uint64_t packed;   /* 8-byte aligned, single atomic read */
+    uint64_t packed;
 } region_slot;
 
 static inline void slot_publish(region_slot *s, uint32_t idx, uint32_t ver) {
     uint64_t p = ((uint64_t)ver << 32) | (uint64_t)idx;
     a_store64(&s->packed, p);
 }
-
 static inline uint64_t slot_load(region_slot *s) {
     return a_load64(&s->packed);
 }
-
 static inline uint32_t slot_idx(uint64_t packed) {
     return (uint32_t)(packed & 0xFFFFFFFFULL);
 }
-
 static inline uint32_t slot_ver(uint64_t packed) {
     return (uint32_t)(packed >> 32);
 }
-
-#else  /* 32-bit: split to avoid 64-bit atomics */
-
+#else
 typedef struct CACHE_ALIGN {
     volatile uint32_t idx;
     char _pad0[CACHE_LINE_SIZE - 4];
@@ -108,12 +102,10 @@ static inline void slot_publish(region_slot *s, uint32_t idx, uint32_t ver) {
     a_store32(&s->idx, idx);
     a_store32(&s->version, ver);
 }
-
 static inline void slot_load(region_slot *s, uint32_t *idx, uint32_t *ver) {
     *ver = a_load32(&s->version);
     *idx = a_load32(&s->idx);
 }
-
 #endif
 
 /* ============================================================
@@ -126,7 +118,6 @@ static inline void *a_alloc(size_t sz) {
     return p;
 }
 
-/* 8-byte aligned alloc for uint64_t arrays (ARMv7 LDREXD requirement) */
 static inline void *a_alloc8(size_t sz) {
     void *p = NULL;
     if (posix_memalign(&p, 8, sz) != 0) abort();
@@ -135,30 +126,19 @@ static inline void *a_alloc8(size_t sz) {
 }
 
 /* ============================================================
- * 6. getcpu 抽象
+ * 6. getcpu / NUMA 检测
  * ============================================================ */
-#if defined(__linux__)
-    #include <sched.h>
-    static inline int get_cpu(void) {
-        int cpu = sched_getcpu();
-        return cpu < 0 ? 0 : cpu;
-    }
-#else
-    static inline int get_cpu(void) { return 0; }
-#endif
+static inline int get_cpu(void) {
+    int cpu = sched_getcpu();
+    return cpu < 0 ? 0 : cpu;
+}
 
-/* ============================================================
- * 7. 运行时 NUMA 节点数获取
- * ============================================================ */
-#include <unistd.h>
 static inline int detect_numa_nodes(void) {
 #if defined(__linux__)
-    /* 读 /sys/devices/system/node/ 下的 online 文件 */
     FILE *f = fopen("/sys/devices/system/node/online", "r");
     if (f) {
         char buf[256] = {0};
         if (fgets(buf, sizeof(buf), f)) {
-            /* 解析 "0-3" 或 "0,1,2,3" 格式 */
             int max_node = 0;
             char *p = buf;
             while (*p) {
@@ -166,20 +146,17 @@ static inline int detect_numa_nodes(void) {
                     int v = atoi(p);
                     if (v > max_node) max_node = v;
                     while (*p >= '0' && *p <= '9') p++;
-                } else {
-                    p++;
-                }
+                } else p++;
             }
             fclose(f);
             return max_node + 1;
         }
         fclose(f);
     }
-    /* fallback: 用 CPU 数估算 */
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     if (n > 0) return (int)n;
 #endif
-    return 1; /* 最小安全值 */
+    return 1;
 }
 
 #endif /* ARCH_DEFS_H */
