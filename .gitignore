@@ -1,9 +1,12 @@
 # 编译产物
-test_idpool
-test_idpool_dbg
-test_idpool_asan
 test_mem
 test_memopt
+test_split
+test_split_dbg
+test_split_asan
+
+# 测试数据/快照
+mem_raw.txt
 
 # 通用
 *.o
