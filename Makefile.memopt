@@ -1,0 +1,44 @@
+# Makefile for fun_idpool memory optimization test
+
+CC      ?= gcc
+CFLAGS  ?= -O3 -std=c99 -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable
+LDFLAGS ?=
+LIBS    ?= -lpthread
+
+SRCS = fun_idpool.c test_memopt.c
+HDRS = fun_idpool.h arch_defs.h
+OBJS = $(SRCS:.c=.o)
+TARGET = test_memopt
+
+.PHONY: all clean run debug asan info
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS) $(LIBS)
+
+%.o: %.c $(HDRS)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+run: $(TARGET)
+	./$(TARGET)
+
+debug: CFLAGS += -O0 -g -DDEBUG
+debug: $(TARGET)
+	./$(TARGET)
+
+asan: CFLAGS += -O1 -g -fsanitize=address -fno-omit-frame-pointer
+asan: LDFLAGS += -fsanitize=address
+asan: $(TARGET)
+	./$(TARGET)
+
+info:
+	@echo "=== Build Info ==="
+	@echo "CC:      $(CC)"
+	@echo "CFLAGS:  $(CFLAGS)"
+	@echo "ARCH:    $(shell uname -m)"
+	@echo "CPUS:    $(shell nproc 2>/dev/null || echo unknown)"
+	@echo "KERNEL:  $(shell uname -r)"
+
+clean:
+	rm -f $(OBJS) $(TARGET)
