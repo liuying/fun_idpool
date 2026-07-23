@@ -1,31 +1,60 @@
-# fun_idpool v8 — 无锁 ID 池
+# fun_idpool v9 — 无锁 ID 池 (Zone 无限制版)
 
 ## 核心特性
 
 - **严格 C99**, 零依赖 (仅 POSIX + GCC 内建原子)
 - **零锁** (mutex/spinlock free) / **零 TLS** / **零引用计数**
-- **Region #0 bit 0 保留**: ID 0 = `FUN_IDPOOL_INVALID_ID` 永不分配
-- **Region 内 ID 单调递增**, 耗尽后才复用
+- **Region #0 bit 0 保留** (ID 0 = `FUN_IDPOOL_INVALID_ID` 永不分配)
+- **Region 内 ID 单调递增**, 耗尽后才复用已释放 ID
+- **Zone 数量无限制** (安全上限 1024, 内存分配精确 / 运算对齐 2 的幂)
 - **懒加载**: bitmap / values / slots / registry 全部按需分配
-- **柔性数组 zones** (`zones[]` 柔性数组成员): 精确 numa_nodes 内存, 消除固定数组浪费
-- **Zone 属性重排**: 热数据 / 统计 / 全局位图 / 动态数组 分别独立 cache line 对齐
-- **动态 slots** (初始 `SLOT_INIT_CAP = 4`, 2 倍扩容)
-- **Zone Registry 动态数组** (per-zone 懒加载, 旧数组延迟释放)
+- **柔性数组 zones** (`zones[]` 柔性数组成员, 精确 numa_nodes 内存)
+- **Zone 属性重排**: 热数据 / 统计 / 全局位图 / 动态数组, 独立 cache line
 - **双模式**: `WITH_VALUE` (绑定指针) / `NO_VALUE` (省内存)
 - **INIT_CAP = 64** (Region #0 可用 63 个 ID, bit 0 保留)
 - **永不返回失败** (OOM 则 `abort`)
+- **跨平台**: x86_64 / x86_32 / AArch64 / ARMv7 / LoongArch64
 
-## v8 设计要点
+## v9 设计要点
 
-相比前版本,v8 主要改动:
+相比 v8 的核心改进:
 
 | 改动 | 说明 |
 |---|---|
-| **柔性数组 zones** | `zones[0..numa_nodes-1]` 替代固定 `zones[16]` 数组, 精确分配内存 |
-| **动态 slots** | `region_slot *slots` 替代固定 `slots[MAX_REGIONS]`, 懒加载扩容 |
-| **动态 registry** | `idpool_region_base **regions_ptr` 替代全局 `zone_registry[][]`, per-zone 管理 |
-| **属性重排** | Zone 内字段按 cache line 分组: 热数据 / 统计 / 大块指针 / 动态数组 |
-| **region_slot 内聚** | 从 `arch_defs.h` 移到 `fun_idpool.c` (业务概念非平台抽象) |
+| **Zone 无限制** | 移除硬编码 16 上限, 安全上限 1024 |
+| **分配精确值** | Zone 数量用于内存分配时是精确值 (flexible array) |
+| **编码对齐值** | 用于 ID 编码时对齐到 2 的幂 (zone_mask / zone_shift) |
+
+## ID 编码格式
+
+```
+┌──────────────────────────────┬──────────────────┐
+│         ID Index            │   Zone ID (低)   │
+└──────────────────────────────┴──────────────────┘
+         >> zone_shift              & zone_mask
+
+ID = (region_base + bit_offset) << zone_shift | zone_id
+
+Region #0: [bit0=保留] bit1→ID1 ... bit63→ID63     (63 个 ID)
+Region #1: bit0→ID64  ... bit127→ID191              (128 个 ID)
+Region #2: bit0→ID192 ... bit447→ID447             (256 个 ID)
+...
+```
+
+## Zone 数量对齐示例
+
+| 指定 Zone 数 | 实际 Zone 数 | 对齐后 | zone_shift | zone_mask |
+|---|---|---|---|---|
+| 1 | 1 | 1 | 0 | 0 |
+| 2 | 2 | 2 | 1 | 1 |
+| 4 | 4 | 4 | 2 | 3 |
+| 17 | 17 | 32 | 5 | 31 |
+| 31 | 31 | 32 | 5 | 31 |
+| 33 | 33 | 64 | 6 | 63 |
+| 64 | 64 | 64 | 6 | 63 |
+| 1024 | 1024 | 1024 | 10 | 1023 |
+
+> Zone 数量用于内存分配时是精确值, 用于 ID 编码时对齐到 2 的幂。
 
 ## Region #0 bit 0 保留策略
 
@@ -41,44 +70,32 @@
 
 **安全性**: bit 0 预设 + cursor 起点跳过, 双保险。
 
-## ID 编码
-
-```
-ID = (region_base + bit_offset) << zone_shift | zone_id
-
-Region #0: base=0,   bit 1~63   → ID 1~63     (bit 0 永久保留)
-Region #1: base=64,  bit 0~63   → ID 64~127
-Region #2: base=128, bit 0~63   → ID 128~191
-...
-Region #k: base=64*(2^k - 1), cap=64*2^k
-```
-
 ## 文件
 
 | 文件 | 说明 |
 |---|---|
 | `arch_defs.h` | 平台抽象层 (cache line / 原子 / 对齐 / NUMA) |
 | `fun_idpool.h` | 公共 API (8 个函数 + 模式枚举 + 统计结构体) |
-| `fun_idpool.c` | 完整实现 (~720 行, v8: 柔性数组 + 动态 slots) |
-| `test_v8.c` | 6 项综合测试 (单 Region / ID 编解码 / MT / 极端并发 / 长生命周期 / 内存统计) |
-| `Makefile` | 构建脚本 (all / run / debug / asan / info / clean) |
-| `Makefile.mem` | 旧版内存测试 Makefile (test_mem) |
-| `Makefile.memopt` | 双模式内存测试 Makefile (test_memopt) |
+| `fun_idpool.c` | 完整实现 (~720 行, v9: Zone 数量无限制) |
+| `test_v9.c` | 8 项综合测试 |
+| `Makefile` | 构建脚本 (all / run / debug / asan) |
+| `Makefile.mem` | 旧版内存分析 Makefile (test_mem) |
+| `Makefile.memopt` | 双模式测试 Makefile (test_memopt) |
 
 ## API
 
 ```c
 #include "fun_idpool.h"
 
-/* ===== 创建 ===== */
+/* ===== 创建 (Zone 数量无限制, 0 = 自动检测, 上限 1024) ===== */
 fun_idpool_t pool = fun_idpool_create(4);             /* 默认 WITH_VALUE */
 fun_idpool_t pool_nv = fun_idpool_create_ex(4, FUN_IDPOOL_MODE_NO_VALUE);
 fun_idpool_t pool_wv = fun_idpool_create_ex(4, FUN_IDPOOL_MODE_WITH_VALUE);
 
 /* ===== 分配/查询/释放 ===== */
 uint32_t id = fun_idpool_gen_id(pool, my_ptr);         /* 永不返回 0 */
-void *ptr  = fun_idpool_get_value(pool, id);           /* WITH_VALUE: ptr; NO_VALUE: FUN_IDPOOL_EXISTS / NULL */
-void *ptr  = fun_idpool_release_id(pool, id);          /* 释放, 返回原值 */
+void *ptr  = fun_idpool_get_value(pool, id);           /* 取回指针 */
+void *ptr  = fun_idpool_release_id(pool, id);          /* 释放 */
 
 /* ===== 统计 ===== */
 fun_idpool_stats_s stats;
@@ -102,27 +119,30 @@ fun_idpool_destroy(pool);
 ## 构建与测试
 
 ```bash
-make           # Release 编译 (test_v8)
-make run       # 运行 test_v8
-make debug     # Debug 构建 (-O0 -g)
-make asan      # AddressSanitizer 构建
-make info      # 显示构建配置
-make clean     # 清理
+make                # Release 编译 (test_v9)
+make run            # 运行主测试 (默认 16 线程 × 5000 ops)
+make run THREADS=32 OPS=10000
+make debug          # Debug 构建 (-O0 -g)
+make asan           # AddressSanitizer
+make info           # 显示构建配置
+make clean          # 清理
 
-# 旧版内存测试
+# 旧版测试 (Makefile.mem / Makefile.memopt)
 make -f Makefile.mem
 make -f Makefile.memopt
 ```
 
-### 测试覆盖 (test_v8 6 项)
+### 测试覆盖 (test_v9 8 项)
 
 ```
-1. Same-Region Monotonic    [PASS]  alloc[0..62]=1..63, alloc[63]=64 (跳 Region #0 bit 0)
-2. ID Encoding               [PASS]  100K IDs 全量回环, 0 mismatches
-3. Multithread (16 × 5000)   [PASS]  ~16 M ops/s, 0 errors
-4. Extreme Concurrency       [PASS]  极端并发场景
-5. NO_VALUE vs WITH_VALUE    [PASS]  两种模式独立验证
-6. Memory Statistics         [PASS]  bitmap/values 统计自洽
+1. bit0 reserved + INIT_CAP=64                → PASS
+2. ID encode/decode 100K                     → 0 mismatches
+3. Multithread (16 × 5000)                     → ~16 M ops/s, 0 errors
+4. Extreme (32 × 2000)                         → 0 errors
+5. NO_VALUE mode (values_mem=0)              → PASS
+6. Dynamic zones/slots (2 zones)             → PASS
+7. Unlimited zones (1/17/31/64/1024)         → ALL PASS
+8. ID encoding with large zone count         → 0 mismatches
 ```
 
 ## 模式选择建议
@@ -153,16 +173,22 @@ make -f Makefile.memopt
 | `total_regions` | 当前已发布 Region 总数 (跨 zone) |
 | `mode` | 池模式 (创建时确定, 不可变) |
 
+可与 `mallinfo2()` 交叉验证内存占用。
+
 ## 约束与限制
 
-- **ID 上限**: 单 zone 单 Region 最大 `1 << 20 = 1M` 个 ID
-- **Zone 数量**: 1 ~ 16, 超出会被截断
-- **MAX_REGIONS**: 256 (达到时 `create_region` 会 `abort`)
-- **线程安全**:
-  - `gen_id` / `release_id` / `get_value` 多线程安全 (无锁)
-  - `create` / `destroy` **不可与 gen_id 并发**
+- **Zone 数量**: 1 ~ 1024, 超出会被截断 (实际系统远小于此值)
 - **ID 编码**: `ID = (region_base + bit_offset) << zone_shift | zone_id`
-- **Region #0**: bit 0 永久保留 (ID 0 永不分配)
+- **Region 数量**: `MAX_REGIONS = 256` (达到时 `create_region` 会 `abort`)
+- **Region 大小**: 单 Region 最大 `1 << 20 = 1M` 个 ID
+- **线程安全**:
+  - `gen_id` / `release_id` / `get_value` 多线程安全 (lock-free)
+  - `create` / `destroy` **不可与 gen_id 并发**
+  - 跨池不保证亲和性, 每个池独立管理自己的 zone
+- **Region #0 特殊**: bit 0 永久保留 (ID 0 永不分配)
+- **Zone 数量分配 vs 编码**:
+  - 内存分配: 精确分配 `numa_nodes` 个 zone (柔性数组)
+  - ID 编码: 对齐到 2 的幂 (zone_mask / zone_shift)
 
 ## 平台支持
 
@@ -176,4 +202,4 @@ make -f Makefile.memopt
 
 ## License
 
-Public domain / MIT — see [`LICENSE`](LICENSE) for full text.
+Public domain / MIT (your choice).
