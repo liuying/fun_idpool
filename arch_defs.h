@@ -7,13 +7,16 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <sched.h>
 #include <sys/syscall.h>
 #include <pthread.h>
-#include <sched.h>
 #include <stdarg.h>
 
 /* ============================================================
  * 1. Cache line size — 平台自适应
+ *    x86_64 / AArch64 / LoongArch64: 64 字节
+ *    x86_32 / ARMv7:                 32 字节
+ *    其他:                           默认 64 字节
  * ============================================================ */
 #if defined(__x86_64__) || defined(__aarch64__) || defined(__loongarch__)
     #define CACHE_LINE_SIZE 64
@@ -28,7 +31,7 @@
 #define ALIGN_4 __attribute__((aligned(4)))
 
 /* ============================================================
- * 2. 指针位宽判断
+ * 2. 指针位宽判断 (决定 Region Slot 的内存布局)
  * ============================================================ */
 #if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 8
     #define ARCH_64BIT 1
@@ -37,8 +40,8 @@
 #endif
 
 /* ============================================================
- * 3. 原子操作包装
- *    统一使用 __atomic_* 内建，跨平台、跨位宽
+ * 3. Atomic wrappers (GCC __atomic_*)
+ *    统一使用 __atomic_* 内建, 跨平台、跨位宽
  * ============================================================ */
 
 /* 32-bit load/store/add/cas */
@@ -74,7 +77,7 @@ static inline uint64_t a_fadd64(uint64_t *p, uint64_t v) {
 }
 
 /* ============================================================
- * 4. Region Slot — 平台自适应
+ * 4. Region Slot (platform-adaptive)
  *
  * 64-bit: packed = [version:32][idx:32]  一次原子读
  * 32-bit:  idx + version 分两个 cache-line 隔离的 32-bit 变量
@@ -91,12 +94,8 @@ static inline void slot_publish(region_slot *s, uint32_t idx, uint32_t ver) {
 static inline uint64_t slot_load(region_slot *s) {
     return a_load64(&s->packed);
 }
-static inline uint32_t slot_idx(uint64_t packed) {
-    return (uint32_t)(packed & 0xFFFFFFFFULL);
-}
-static inline uint32_t slot_ver(uint64_t packed) {
-    return (uint32_t)(packed >> 32);
-}
+static inline uint32_t slot_idx(uint64_t p) { return (uint32_t)(p & 0xFFFFFFFFULL); }
+static inline uint32_t slot_ver(uint64_t p) { return (uint32_t)(p >> 32); }
 #else  /* 32-bit: split to avoid 64-bit atomics */
 typedef struct CACHE_ALIGN {
     volatile uint32_t idx;
@@ -116,7 +115,7 @@ static inline void slot_load(region_slot *s, uint32_t *idx, uint32_t *ver) {
 #endif
 
 /* ============================================================
- * 5. 对齐内存分配
+ * 5. 对齐内存分配 (cache line / 8 字节)
  * ============================================================ */
 static inline void *a_alloc(size_t sz) {
     void *p = NULL;

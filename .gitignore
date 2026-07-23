@@ -4,6 +4,12 @@ test_memopt
 test_split
 test_split_dbg
 test_split_asan
+test_bit0
+test_bit0_dbg
+test_bit0_asan
+verify_bit0
+verify_bit0_dbg
+verify_bit0_asan
 
 # 测试数据/快照
 mem_raw.txt
