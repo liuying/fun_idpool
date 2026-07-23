@@ -16,6 +16,7 @@
  *   - 跨平台（x86_64/x86_32/AArch64/ARMv7/LoongArch64）
  * ============================================================ */
 
+/* 无效 ID 哨兵值 (gen_id 永不返回 0) */
 #define FUN_IDPOOL_INVALID_ID 0
 
 /* ID 存在哨兵值（NO_VALUE 模式下 get_value 返回此值表示 ID 存在） */
@@ -27,8 +28,8 @@ typedef enum {
     FUN_IDPOOL_MODE_NO_VALUE   = 1   /* 仅管理 ID，不存指针，极致省内存 */
 } fun_idpool_mode_t;
 
-/* ---------- 类型定义 ---------- */
-typedef struct fun_idpool_s fun_idpool_s, *fun_idpool_t;
+/* ---------- 类型前向声明 ---------- */
+typedef struct fun_idpool_s       fun_idpool_s,       *fun_idpool_t;
 typedef struct fun_idpool_stats_s fun_idpool_stats_s, *fun_idpool_stats_t;
 
 /* ---------- API ---------- */
@@ -60,28 +61,31 @@ uint32_t fun_idpool_gen_id(fun_idpool_t pool, void *ptr);
  */
 void *fun_idpool_get_value(fun_idpool_t pool, uint32_t id);
 
-/* 释放 ID，返回之前绑定的指针（NO_VALUE 模式返回 FUN_IDPOOL_EXISTS 或 NULL） */
+/* 释放 ID
+ *   返回之前绑定的指针（WITH_VALUE 模式）或 FUN_IDPOOL_EXISTS（NO_VALUE 模式）
+ *   ID 无效或已释放时返回 NULL
+ */
 void *fun_idpool_release_id(fun_idpool_t pool, uint32_t id);
 
 /* 获取统计信息 */
 void fun_idpool_get_stats(fun_idpool_t pool, fun_idpool_stats_t stats);
 
-/* 查询当前模式 */
+/* 查询当前模式（WITHOUT_VALUE = 0 / NO_VALUE = 1） */
 fun_idpool_mode_t fun_idpool_get_mode(fun_idpool_t pool);
 
 /* ---------- 统计结构体 ---------- */
 struct fun_idpool_stats_s {
-    uint64_t total_alloc;
-    uint64_t total_freed;
-    uint64_t scan_retries;
-    uint64_t reuse_count;
-    uint64_t abort_count;
-    uint32_t numa_nodes;
-    uint32_t total_regions;
-    uint64_t bitmap_memory;    /* 位图占用字节数 */
-    uint64_t values_memory;    /* values 数组占用字节数（NO_VALUE 为 0）*/
-    uint64_t region_memory;    /* Region 结构体占用字节数 */
-    fun_idpool_mode_t mode;    /* 当前模式 */
+    uint64_t total_alloc;       /* 总分配次数（跨 zone 累计） */
+    uint64_t total_freed;       /* 总释放次数 */
+    uint64_t scan_retries;      /* TAS 失败回退次数（cursor 推进计数） */
+    uint64_t reuse_count;       /* 复用已释放 ID 的次数 */
+    uint64_t abort_count;       /* 内部错误中止次数 */
+    uint32_t numa_nodes;        /* 实际 zone 数 */
+    uint32_t total_regions;     /* 当前已发布 Region 总数（跨 zone） */
+    uint64_t bitmap_memory;     /* 位图占用字节数（bitmap + summary 累计） */
+    uint64_t values_memory;     /* values 数组占用字节数（NO_VALUE 为 0）*/
+    uint64_t region_memory;     /* Region 结构体占用字节数（按 mode 区分大小） */
+    fun_idpool_mode_t mode;     /* 当前模式（创建时确定，不可变） */
 };
 
 #endif /* FUN_IDPOOL_H */
