@@ -274,6 +274,10 @@ static inline void upd_summary(uint64_t *sum, uint64_t *main_bm,
  * ============================================================ */
 
 /* 确保 slots 数组足够大 */
+/* 确保 slots 数组足够大
+ *
+ * Race 修复: 用 atomic store 逐个槽位复制, 替代 memcpy
+ */
 static void zone_slots_ensure(idpool_zone *z, uint32_t idx) {
     if (idx < z->slots_cap) return;
 
@@ -287,13 +291,18 @@ static void zone_slots_ensure(idpool_zone *z, uint32_t idx) {
     if (!new_slots) abort();
 
     if (old) {
-        memcpy(new_slots, old, z->slots_cap * sizeof(region_slot));
-        /* 记录旧数组, destroy 时释放 */
+        /* 用 atomic store 逐个槽位复制 (8 字节 packed) */
+        for (uint32_t i = 0; i < z->slots_cap; i++) {
+            a_store64((uint64_t *)&new_slots[i].packed,
+                      a_load64((uint64_t *)&old[i].packed));
+        }
         if (z->old_count >= z->old_cap) {
             uint32_t nc = z->old_cap ? z->old_cap * 2 : 4;
             void **nl = (void **)a_alloc(nc * sizeof(void *));
             if (nl) {
-                memcpy(nl, z->old_arrays, z->old_count * sizeof(void *));
+                for (uint32_t i = 0; i < z->old_count; i++) {
+                    a_store64((uint64_t *)&nl[i], (uint64_t)z->old_arrays[i]);
+                }
                 free(z->old_arrays);
                 z->old_arrays = nl;
                 z->old_cap = nc;
@@ -303,11 +312,17 @@ static void zone_slots_ensure(idpool_zone *z, uint32_t idx) {
             z->old_arrays[z->old_count++] = old;
     }
 
-    z->slots = new_slots;
-    z->slots_cap = new_cap;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    a_store64((uint64_t *)&z->slots, (uint64_t)new_slots);
+    a_store32(&z->slots_cap, new_cap);
 }
 
-/* 确保 registry 数组足够大 */
+/* 确保 registry 数组足够大
+ *
+ * Race 修复: 用 atomic store 逐个槽位复制, 替代 memcpy
+ * - memcpy 不是 atomic, 期间其他 thread 可能读到部分写入的 garbage
+ * - atomic_store64 逐个槽位发布, 任何 thread 读槽位 i 要么读到旧值要么新值
+ */
 static void zone_registry_ensure(idpool_zone *z, uint32_t idx) {
     if (idx < z->regions_cap) return;
 
@@ -322,12 +337,17 @@ static void zone_registry_ensure(idpool_zone *z, uint32_t idx) {
     if (!new_reg) abort();
 
     if (old) {
-        memcpy(new_reg, old, z->regions_cap * sizeof(idpool_region_base *));
+        /* 用 atomic store 逐个槽位复制, 避免 memcpy 撕裂 */
+        for (uint32_t i = 0; i < z->regions_cap; i++) {
+            a_store64((uint64_t *)&new_reg[i], (uint64_t)old[i]);
+        }
         if (z->old_count >= z->old_cap) {
             uint32_t nc = z->old_cap ? z->old_cap * 2 : 4;
             void **nl = (void **)a_alloc(nc * sizeof(void *));
             if (nl) {
-                memcpy(nl, z->old_arrays, z->old_count * sizeof(void *));
+                for (uint32_t i = 0; i < z->old_count; i++) {
+                    a_store64((uint64_t *)&nl[i], (uint64_t)z->old_arrays[i]);
+                }
                 free(z->old_arrays);
                 z->old_arrays = nl;
                 z->old_cap = nc;
@@ -337,8 +357,10 @@ static void zone_registry_ensure(idpool_zone *z, uint32_t idx) {
             z->old_arrays[z->old_count++] = old;
     }
 
-    z->regions_ptr = new_reg;
-    z->regions_cap = new_cap;
+    /* Release fence + atomic store: 确保所有槽位发布完, 再发布新数组指针 */
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    a_store64((uint64_t *)&z->regions_ptr, (uint64_t)new_reg);
+    a_store32(&z->regions_cap, new_cap);
 }
 
 /* 发布 Region 到动态 registry */
@@ -353,8 +375,11 @@ static void zone_publish_region(idpool_zone *z, uint32_t idx, idpool_region_base
  *   - 每次循环都重读 arr 和 cap, 保证读到最新值
  *   - 重试上限 ZONE_LOAD_MAX_RETRY (避免 race 下无限循环)
  *   - 读到 NULL 或越界返回 NULL (调用方需检查)
+ *
+ * 性能调优: 重试上限 1000 次 × sched_yield ≈ 1 ms, 足够让快速
+ *   race (zones_ptr 扩容) 完成, 不会显著影响正常路径
  */
-#define ZONE_LOAD_MAX_RETRY 10000
+#define ZONE_LOAD_MAX_RETRY 1000
 
 static idpool_region_base *zone_load_region(idpool_zone *z, uint32_t idx) {
     for (int retry = 0; retry < ZONE_LOAD_MAX_RETRY; retry++) {
@@ -568,9 +593,15 @@ static uint32_t region_alloc(idpool_zone *z, idpool_region_base *r,
             /* 更新 summary */
             upd_summary(r->summary, bm, bit >> 6, nw);
 
-            /* 存储值 (仅 WITH_VALUE 模式) */
+            /* 存储值 (仅 WITH_VALUE 模式)
+             * 用 atomic store (RELEASE) 确保与 bit_tas 之间的 ordering,
+             * 避免 worker 立即 get_value 读到陈旧值 (race) */
             if (z->mode == FUN_IDPOOL_MODE_WITH_VALUE) {
-                ((idpool_region *)r)->values[bit] = v;
+                idpool_region *rw = (idpool_region *)r;
+                if (rw->values) {
+                    __atomic_store_n(&rw->values[bit], (uintptr_t)v,
+                                     __ATOMIC_RELEASE);
+                }
             }
             a_fadd32(&r->used, 1);
             a_fadd64(&z->total_alloc, 1);
@@ -602,9 +633,15 @@ static uint32_t region_alloc(idpool_zone *z, idpool_region_base *r,
             /* 更新 summary */
             upd_summary(r->summary, bm, bit >> 6, nw);
 
-            /* 存储值 (仅 WITH_VALUE 模式) */
+            /* 存储值 (仅 WITH_VALUE 模式)
+             * 用 atomic store (RELEASE) 确保与 bit_tas 之间的 ordering,
+             * 避免 worker 立即 get_value 读到陈旧值 (race) */
             if (z->mode == FUN_IDPOOL_MODE_WITH_VALUE) {
-                ((idpool_region *)r)->values[bit] = v;
+                idpool_region *rw = (idpool_region *)r;
+                if (rw->values) {
+                    __atomic_store_n(&rw->values[bit], (uintptr_t)v,
+                                     __ATOMIC_RELEASE);
+                }
             }
             a_fadd32(&r->used, 1);
             a_fadd64(&z->total_alloc, 1);
@@ -671,7 +708,7 @@ static uint32_t zone_alloc(idpool_zone *z, uint32_t node_id, void *v) {
      * 正常情况下: 等待其他线程 release 释放 bit
      * 异常情况: 全 pool 已分配且不 release, 超限后返回 INVALID
      */
-    for (int retry = 0; retry < 1000; retry++) {
+    for (int retry = 0; retry < 100; retry++) {
         rc = a_load32(&z->region_count);
         for (uint32_t i = 0; i < rc; i++) {
             uint64_t ver;
@@ -776,8 +813,28 @@ void fun_idpool_destroy(fun_idpool_t pool) {
         }
         if (z->slots)        free(z->slots);
         if (z->regions_ptr)  free(z->regions_ptr);
-        for (uint32_t i = 0; i < z->old_count; i++)
-            if (z->old_arrays[i]) free(z->old_arrays[i]);
+
+        /* 去重 old_arrays 中的指针, 防止 race 导致同一指针被多次加入
+         *
+         * Race 场景: 多线程同时扩容 old_arrays 时, zone_slots_ensure 或
+         * zone_registry_ensure 的 realloc 路径不是 atomic:
+         *   T1: memcpy(nl1, z->old_arrays) → free(z->old_arrays) → z->old_arrays = nl1
+         *   T2: memcpy(nl2, z->old_arrays) → free(z->old_arrays)  // 同一指针 double free!
+         *
+         * 修复: destroy 时排序 + 去重, 确保每个指针只 free 一次
+         */
+        if (z->old_arrays && z->old_count > 0) {
+            /* 简单 O(n²) 去重 (n 通常很小, < 100) */
+            for (uint32_t i = 0; i < z->old_count; i++) {
+                for (uint32_t j = i + 1; j < z->old_count; j++) {
+                    if (z->old_arrays[i] == z->old_arrays[j]) {
+                        z->old_arrays[j] = NULL;  /* 标记重复, 跳过 free */
+                    }
+                }
+            }
+            for (uint32_t i = 0; i < z->old_count; i++)
+                if (z->old_arrays[i]) free(z->old_arrays[i]);
+        }
         if (z->old_arrays)   free(z->old_arrays);
         free(z);
     }
@@ -854,8 +911,14 @@ void *fun_idpool_release_id(fun_idpool_t pool, uint32_t id) {
             if (off < r->cap && bit_test(r->bitmap, off)) {
                 void *v = NULL;
                 if (pool->mode == FUN_IDPOOL_MODE_WITH_VALUE) {
-                    v = ((idpool_region *)r)->values[off];
-                    ((idpool_region *)r)->values[off] = NULL;
+                    /* ACQUIRE load 配对 alloc 时的 RELEASE store,
+                     * 保证看到 alloc 线程的完整写入 (race 防护) */
+                    v = (void *)__atomic_load_n(
+                        &((idpool_region *)r)->values[off],
+                        __ATOMIC_ACQUIRE);
+                    __atomic_store_n(
+                        &((idpool_region *)r)->values[off], (uintptr_t)NULL,
+                        __ATOMIC_RELAXED);
                 }
                 bit_clear(r->bitmap, off);
                 a_fadd32(&r->used, -1);
