@@ -347,18 +347,34 @@ static void zone_publish_region(idpool_zone *z, uint32_t idx, idpool_region_base
     a_store64((uint64_t *)&z->regions_ptr[idx], (uint64_t)r);
 }
 
-/* 加载 Region (处理扩容瞬态) */
+/* 加载 Region (处理扩容瞬态)
+ *
+ * 安全保证:
+ *   - 每次循环都重读 arr 和 cap, 保证读到最新值
+ *   - 重试上限 ZONE_LOAD_MAX_RETRY (避免 race 下无限循环)
+ *   - 读到 NULL 或越界返回 NULL (调用方需检查)
+ */
+#define ZONE_LOAD_MAX_RETRY 10000
+
 static idpool_region_base *zone_load_region(idpool_zone *z, uint32_t idx) {
-    for (;;) {
+    for (int retry = 0; retry < ZONE_LOAD_MAX_RETRY; retry++) {
         idpool_region_base **arr = (idpool_region_base **)a_load64(
             (uint64_t *)&z->regions_ptr);
         if (!arr) return NULL;
         uint32_t cap = a_load32(&z->regions_cap);
         if (idx < cap) {
-            return (idpool_region_base *)a_load64((uint64_t *)&arr[idx]);
+            idpool_region_base *r = (idpool_region_base *)a_load64(
+                (uint64_t *)&arr[idx]);
+            /* 防止 race 下读到陈旧值 (扩容时 memcpy 后旧数组元素可能被覆盖) */
+            if (r == NULL) {
+                sched_yield();
+                continue;
+            }
+            return r;
         }
         sched_yield();
     }
+    return NULL;  /* 重试超限, 让调用方安全跳过 */
 }
 
 /* 加载 slot */
@@ -650,8 +666,12 @@ static uint32_t zone_alloc(idpool_zone *z, uint32_t node_id, void *v) {
         if (id != FUN_IDPOOL_INVALID_ID) return id;
     }
 
-    /* 极端竞争: 忙等 */
-    for (;;) {
+    /* 极端竞争: 忙等 (加重试上限避免 race 下无限 spin)
+     *
+     * 正常情况下: 等待其他线程 release 释放 bit
+     * 异常情况: 全 pool 已分配且不 release, 超限后返回 INVALID
+     */
+    for (int retry = 0; retry < 1000; retry++) {
         rc = a_load32(&z->region_count);
         for (uint32_t i = 0; i < rc; i++) {
             uint64_t ver;
@@ -662,6 +682,7 @@ static uint32_t zone_alloc(idpool_zone *z, uint32_t node_id, void *v) {
         }
         sched_yield();
     }
+    return FUN_IDPOOL_INVALID_ID;  /* 超限返回, 避免死循环 */
 }
 
 /* ============================================================
@@ -871,12 +892,17 @@ void fun_idpool_get_stats(fun_idpool_t pool, fun_idpool_stats_t stats) {
         /* 估算内存 */
         for (uint32_t i = 0; i < rc; i++) {
             idpool_region_base *r = zone_load_region(z, i);
-            if (!r || !a_load32(&r->alloced)) continue;
-            uint32_t nw = (r->cap + 63) >> 6;
+            /* 双重 NULL 检查: zone_load_region 失败可能因 race 读 NULL */
+            if (!r) continue;
+            if (!a_load32(&r->alloced)) continue;  /* Region 未完成初始化 */
+            /* 验证 cap 字段合法 (防止 race 读到陈旧指针) */
+            uint32_t cap = r->cap;
+            if (cap == 0 || cap > MAX_CAP) continue;
+            uint32_t nw = (cap + 63) >> 6;
             uint32_t sw = (nw + 63) >> 6;
             stats->bitmap_memory += (nw + sw) * sizeof(uint64_t);
             if (pool->mode == FUN_IDPOOL_MODE_WITH_VALUE)
-                stats->values_memory += r->cap * sizeof(void *);
+                stats->values_memory += cap * sizeof(void *);
         }
     }
 }
