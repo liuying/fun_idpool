@@ -273,26 +273,30 @@ static inline void upd_summary(uint64_t *sum, uint64_t *main_bm,
  *   比之前固定数组 (128 + 1024 B) 省 96%
  * ============================================================ */
 
-/* 确保 slots 数组足够大 */
 /* 确保 slots 数组足够大
  *
- * Race 修复: 用 atomic store 逐个槽位复制, 替代 memcpy
+ * Race 修复 (round 2): 与 zone_registry_ensure 同 — atomic load 一次 cap,
+ * atomic load ptr,循环 bound 用捕获的 cur_cap,避免读到旧指针配新 cap 的
+ * 越界 (ASAN 报告在此函数触发 heap-buffer-overflow)。
  */
 static void zone_slots_ensure(idpool_zone *z, uint32_t idx) {
-    if (idx < z->slots_cap) return;
+    uint32_t cur_cap = a_load32(&z->slots_cap);
+    if (idx < cur_cap) return;
 
-    uint32_t new_cap = z->slots_cap ? z->slots_cap : SLOT_INIT_CAP;
+    uint32_t new_cap = cur_cap ? cur_cap : SLOT_INIT_CAP;
     while (new_cap <= idx) new_cap <<= 1;
     if (new_cap > MAX_REGIONS) new_cap = MAX_REGIONS;
     if (idx >= new_cap) abort();
 
-    region_slot *old = z->slots;
     region_slot *new_slots = (region_slot *)a_alloc(new_cap * sizeof(region_slot));
     if (!new_slots) abort();
 
+    /* ACQUIRE load 配对发行方 (fence + RELEASE store) */
+    region_slot *old = (region_slot *)a_load64((uint64_t *)&z->slots);
     if (old) {
-        /* 用 atomic store 逐个槽位复制 (8 字节 packed) */
-        for (uint32_t i = 0; i < z->slots_cap; i++) {
+        /* 用 atomic store 逐个槽位复制 (8 字节 packed);
+         * bound 用捕获的 cur_cap,与 old 的实际发布容量一致 */
+        for (uint32_t i = 0; i < cur_cap; i++) {
             a_store64((uint64_t *)&new_slots[i].packed,
                       a_load64((uint64_t *)&old[i].packed));
         }
@@ -319,26 +323,39 @@ static void zone_slots_ensure(idpool_zone *z, uint32_t idx) {
 
 /* 确保 registry 数组足够大
  *
- * Race 修复: 用 atomic store 逐个槽位复制, 替代 memcpy
- * - memcpy 不是 atomic, 期间其他 thread 可能读到部分写入的 garbage
- * - atomic_store64 逐个槽位发布, 任何 thread 读槽位 i 要么读到旧值要么新值
+ * Race 修复 (round 2): 之前用 atomic store 逐个槽位发布,但 reader 端
+ * 仍然以普通读写访问 regions_ptr / regions_cap,导致:
+ * 1. ASAN 抓到 reader 看到的旧 regions_ptr (4 slots) 配新 regions_cap (8),
+ *    循环 i<cap 越界读。
+ * 2. reader 之间存在 data race (UB)。
+ *
+ * 现在:
+ * - 一进函数就 atomic load 一次 regions_cap,作为循环 bound。
+ * - regions_ptr 改成 atomic load (ACQUIRE),配对发行方的 RELEASE store。
+ * - 在 x86 TSO 下,stores 不会重排:发行方先 store ptr 再 store cap,
+ *   reader 只要 ACQUIRE load 两者,看到的 ptr 至少 == 同时刻的 cap 所对应的
+ *   那次发布的数组,容量 >= 已发布 cap,循环 i<cur_cap 不会越界。
  */
 static void zone_registry_ensure(idpool_zone *z, uint32_t idx) {
-    if (idx < z->regions_cap) return;
+    uint32_t cur_cap = a_load32(&z->regions_cap);
+    if (idx < cur_cap) return;
 
-    uint32_t new_cap = z->regions_cap ? z->regions_cap : SLOT_INIT_CAP;
+    uint32_t new_cap = cur_cap ? cur_cap : SLOT_INIT_CAP;
     while (new_cap <= idx) new_cap <<= 1;
     if (new_cap > MAX_REGIONS) new_cap = MAX_REGIONS;
     if (idx >= new_cap) abort();
 
-    idpool_region_base **old = z->regions_ptr;
     idpool_region_base **new_reg = (idpool_region_base **)a_alloc8(
         new_cap * sizeof(idpool_region_base *));
     if (!new_reg) abort();
 
+    /* 一次性读 ptr (ACQUIRE 配对发行方 RELEASE),与 cur_cap 同处一函数顶部 */
+    idpool_region_base **old = (idpool_region_base **)a_load64(
+        (uint64_t *)&z->regions_ptr);
     if (old) {
-        /* 用 atomic store 逐个槽位复制, 避免 memcpy 撕裂 */
-        for (uint32_t i = 0; i < z->regions_cap; i++) {
+        /* 用 atomic store 逐个槽位复制, 避免 memcpy 撕裂;
+         * bound 用捕获的 cur_cap,与 old 的实际发布容量一致 */
+        for (uint32_t i = 0; i < cur_cap; i++) {
             a_store64((uint64_t *)&new_reg[i], (uint64_t)old[i]);
         }
         if (z->old_count >= z->old_cap) {
@@ -383,10 +400,13 @@ static void zone_publish_region(idpool_zone *z, uint32_t idx, idpool_region_base
 
 static idpool_region_base *zone_load_region(idpool_zone *z, uint32_t idx) {
     for (int retry = 0; retry < ZONE_LOAD_MAX_RETRY; retry++) {
+        /* 先读 cap (atomic load): 若 cap 已增长到 X, 必然意味着对应的
+         * regions_ptr 也已经发布了至少 X 容量的新数组 (发行方 ptr 先 cap 后),
+         * x86 TSO 下保证 arr 随后读到的指针容量 >= cap。 */
+        uint32_t cap = a_load32(&z->regions_cap);
         idpool_region_base **arr = (idpool_region_base **)a_load64(
             (uint64_t *)&z->regions_ptr);
         if (!arr) return NULL;
-        uint32_t cap = a_load32(&z->regions_cap);
         if (idx < cap) {
             idpool_region_base *r = (idpool_region_base *)a_load64(
                 (uint64_t *)&arr[idx]);
@@ -407,17 +427,25 @@ static idpool_region_base *load_region(idpool_zone *z, uint32_t idx, uint64_t *v
     if (idx >= MAX_REGIONS) { *ver_out = 0; return NULL; }
 
 #if ARCH_64BIT
-    if (idx >= z->slots_cap) { *ver_out = 0; return NULL; }
-    region_slot *s = &z->slots[idx];
+    /* 先 atomic load slots_cap,再 atomic load slots,与发行方 (cap 后 ptr)
+     * 的顺序配合,x86 TSO 保证 slots 容量 >= slots_cap */
+    uint32_t s_cap = a_load32(&z->slots_cap);
+    if (idx >= s_cap) { *ver_out = 0; return NULL; }
+    region_slot *s_arr = (region_slot *)a_load64((uint64_t *)&z->slots);
+    if (!s_arr) { *ver_out = 0; return NULL; }
+    region_slot *s = &s_arr[idx];
     uint64_t packed = slot_load(s);
     if (packed == 0) { *ver_out = 0; return NULL; }
     uint32_t s_idx = slot_idx(packed);
     *ver_out = slot_ver(packed);
     return zone_load_region(z, s_idx);
 #else
-    if (idx >= z->slots_cap) { *ver_out = 0; return NULL; }
+    uint32_t s_cap = a_load32(&z->slots_cap);
+    if (idx >= s_cap) { *ver_out = 0; return NULL; }
+    region_slot *s_arr = (region_slot *)a_load64((uint64_t *)&z->slots);
+    if (!s_arr) { *ver_out = 0; return NULL; }
     uint32_t s_idx = 0, s_ver = 0;
-    slot_load(&z->slots[idx], &s_idx, &s_ver);
+    slot_load(&s_arr[idx], &s_idx, &s_ver);
     *ver_out = s_ver;
     return zone_load_region(z, s_idx);
 #endif
@@ -885,7 +913,11 @@ void *fun_idpool_get_value(fun_idpool_t pool, uint32_t id) {
         if (idx >= base->base && idx < base->base + base->cap) {
             uint32_t off = idx - base->base;
             if (off < base->cap && bit_test(base->bitmap, off)) {
-                return ((idpool_region *)base)->values[off];
+                /* ACQUIRE 读,配对 zone_alloc 的 RELEASE 写,
+                 * 防止 alloc 后立即 get_value 读到陈旧值 (race) */
+                return (void *)__atomic_load_n(
+                    &((idpool_region *)base)->values[off],
+                    __ATOMIC_ACQUIRE);
             }
             break;
         }

@@ -136,9 +136,10 @@ static void test_no_value_mode(void) {
 
     fun_idpool_destroy(pool);
     size_t after_destroy = heap_used();
-    fprintf(stderr, "  after destroy: %.2f KB (leaked: %.2f KB)\n",
-            after_destroy / 1024.0,
-            (after_destroy - prev) / 1024.0);
+    /* 修复 size_t 下溢:转 int64_t 让"负值"表示 destroy 后比 prev 还小 (回收更多) */
+    double diff_kb = (double)(int64_t)(after_destroy - prev) / 1024.0;
+    fprintf(stderr, "  after destroy: %.2f KB (leaked: %+.2f KB)\n",
+            after_destroy / 1024.0, diff_kb);
 }
 
 /* ============================================================
@@ -355,8 +356,11 @@ static void test_long_lived(int mode) {
 
     fun_idpool_destroy(pool);
     size_t after = heap_used();
-    fprintf(stderr, "  after destroy: %.2f KB (leak: %.2f KB)\n",
-            after / 1024.0, (after - prev) / 1024.0);
+    /* 修复 size_t 下溢:destroy 返回的堆可能比 create 前更小 (释放了 glibc
+     * 的 chunk),无符号减法会 wrap 成巨大值;转 int64_t 后负数 = "回收更多" */
+    double diff_kb = (double)(int64_t)(after - prev) / 1024.0;
+    fprintf(stderr, "  after destroy: %.2f KB (leak: %+.2f KB)\n",
+            after / 1024.0, diff_kb);
 }
 
 /* ============================================================
