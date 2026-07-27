@@ -116,6 +116,22 @@ typedef struct CACHE_ALIGN {
     void **old_arrays;
     uint32_t old_count;
     uint32_t old_cap;
+
+    /* ---- grow_lock: 序列化动态数组扩容 + region/slot 发布 ----
+     *
+     * 持有边界:
+     *   - zone_slots_ensure_locked / zone_registry_ensure_locked
+     *   - old_arrays_push_locked
+     *   - zone_publish_region (ensure+publish 一体)
+     *   - slot_publish 调用方 (取 slots 指针后释放)
+     *
+     * 不持有 (lock-free 热路径, 不阻塞分配/释放):
+     *   - fun_idpool_gen_id / fun_idpool_release_id / fun_idpool_get_value
+     *   - zone_load_region / load_region / create_region 主体 (除 publish 部分)
+     *
+     * 性能影响: 锁只在 region 创建 + 动态数组 grow 持锁,极不频繁
+     */
+    pthread_mutex_t grow_lock CACHE_ALIGN;
 } idpool_zone;
 
 /* ============================================================
@@ -275,15 +291,22 @@ static inline void upd_summary(uint64_t *sum, uint64_t *main_bm,
 
 /* 确保 slots 数组足够大
  *
- * Race 修复 (round 2): 与 zone_registry_ensure 同 — atomic load 一次 cap,
- * atomic load ptr,循环 bound 用捕获的 cur_cap,避免读到旧指针配新 cap 的
- * 越界 (ASAN 报告在此函数触发 heap-buffer-overflow)。
+ * 假定 grow_lock 已持有。
+ * 真正的串行化版本,杜绝多 writer 复制替换的所有 race (lost update、
+ * 容量回退、pointer/cap 不一致、publish 丢失)。
+ *
+ * 注意: 锁内拷贝可直接 memcpy,因为没有并发 reader 持有旧指针访问
+ * (读者用的是 atomic snapshot + retry 协议,即使看到旧 slots 也无所谓,
+ * publish 流程被 zone_publish_region/zone_slots_publish 在同一锁内完成)。
  */
-static void zone_slots_ensure(idpool_zone *z, uint32_t idx) {
-    uint32_t cur_cap = a_load32(&z->slots_cap);
-    if (idx < cur_cap) return;
 
-    uint32_t new_cap = cur_cap ? cur_cap : SLOT_INIT_CAP;
+/* Forward decl: old_arrays_push_locked 在下面定义,但 ensure_locked 需要调用 */
+static void old_arrays_push_locked(idpool_zone *z, void *old_ptr);
+
+static void zone_slots_ensure_locked(idpool_zone *z, uint32_t idx) {
+    if (idx < z->slots_cap) return;
+
+    uint32_t new_cap = z->slots_cap ? z->slots_cap : SLOT_INIT_CAP;
     while (new_cap <= idx) new_cap <<= 1;
     if (new_cap > MAX_REGIONS) new_cap = MAX_REGIONS;
     if (idx >= new_cap) abort();
@@ -291,56 +314,28 @@ static void zone_slots_ensure(idpool_zone *z, uint32_t idx) {
     region_slot *new_slots = (region_slot *)a_alloc(new_cap * sizeof(region_slot));
     if (!new_slots) abort();
 
-    /* ACQUIRE load 配对发行方 (fence + RELEASE store) */
-    region_slot *old = (region_slot *)a_load64((uint64_t *)&z->slots);
+    region_slot *old = z->slots;
     if (old) {
-        /* 用 atomic store 逐个槽位复制 (8 字节 packed);
-         * bound 用捕获的 cur_cap,与 old 的实际发布容量一致 */
-        for (uint32_t i = 0; i < cur_cap; i++) {
-            a_store64((uint64_t *)&new_slots[i].packed,
-                      a_load64((uint64_t *)&old[i].packed));
-        }
-        if (z->old_count >= z->old_cap) {
-            uint32_t nc = z->old_cap ? z->old_cap * 2 : 4;
-            void **nl = (void **)a_alloc(nc * sizeof(void *));
-            if (nl) {
-                for (uint32_t i = 0; i < z->old_count; i++) {
-                    a_store64((uint64_t *)&nl[i], (uint64_t)z->old_arrays[i]);
-                }
-                free(z->old_arrays);
-                z->old_arrays = nl;
-                z->old_cap = nc;
-            }
-        }
-        if (z->old_arrays && z->old_count < z->old_cap)
-            z->old_arrays[z->old_count++] = old;
+        /* 锁内可直接 memcpy (region_slot 内部 packed 用 8-byte atomic store
+         * 在 create 时填充,这里只拷贝已发布的旧值) */
+        memcpy(new_slots, old, z->slots_cap * sizeof(region_slot));
+        old_arrays_push_locked(z, old);
     }
 
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    a_store64((uint64_t *)&z->slots, (uint64_t)new_slots);
-    a_store32(&z->slots_cap, new_cap);
+    /* 锁内发布:ptr 用 atomic store 以匹配 reader 的 atomic load (TSAN)
+     * a_store64 的 uint64_t* 参数透传指针语义 (与现有 a_load64 配对) */
+    a_store64((uint64_t *)&z->slots, (uint64_t)(uintptr_t)new_slots);
+    __atomic_store_n(&z->slots_cap, new_cap, __ATOMIC_RELEASE);
 }
 
 /* 确保 registry 数组足够大
  *
- * Race 修复 (round 2): 之前用 atomic store 逐个槽位发布,但 reader 端
- * 仍然以普通读写访问 regions_ptr / regions_cap,导致:
- * 1. ASAN 抓到 reader 看到的旧 regions_ptr (4 slots) 配新 regions_cap (8),
- *    循环 i<cap 越界读。
- * 2. reader 之间存在 data race (UB)。
- *
- * 现在:
- * - 一进函数就 atomic load 一次 regions_cap,作为循环 bound。
- * - regions_ptr 改成 atomic load (ACQUIRE),配对发行方的 RELEASE store。
- * - 在 x86 TSO 下,stores 不会重排:发行方先 store ptr 再 store cap,
- *   reader 只要 ACQUIRE load 两者,看到的 ptr 至少 == 同时刻的 cap 所对应的
- *   那次发布的数组,容量 >= 已发布 cap,循环 i<cur_cap 不会越界。
+ * 假定 grow_lock 已持有。锁内语义与 zone_slots_ensure_locked 一致。
  */
-static void zone_registry_ensure(idpool_zone *z, uint32_t idx) {
-    uint32_t cur_cap = a_load32(&z->regions_cap);
-    if (idx < cur_cap) return;
+static void zone_registry_ensure_locked(idpool_zone *z, uint32_t idx) {
+    if (idx < z->regions_cap) return;
 
-    uint32_t new_cap = cur_cap ? cur_cap : SLOT_INIT_CAP;
+    uint32_t new_cap = z->regions_cap ? z->regions_cap : SLOT_INIT_CAP;
     while (new_cap <= idx) new_cap <<= 1;
     if (new_cap > MAX_REGIONS) new_cap = MAX_REGIONS;
     if (idx >= new_cap) abort();
@@ -349,41 +344,68 @@ static void zone_registry_ensure(idpool_zone *z, uint32_t idx) {
         new_cap * sizeof(idpool_region_base *));
     if (!new_reg) abort();
 
-    /* 一次性读 ptr (ACQUIRE 配对发行方 RELEASE),与 cur_cap 同处一函数顶部 */
-    idpool_region_base **old = (idpool_region_base **)a_load64(
-        (uint64_t *)&z->regions_ptr);
+    idpool_region_base **old = z->regions_ptr;
     if (old) {
-        /* 用 atomic store 逐个槽位复制, 避免 memcpy 撕裂;
-         * bound 用捕获的 cur_cap,与 old 的实际发布容量一致 */
-        for (uint32_t i = 0; i < cur_cap; i++) {
-            a_store64((uint64_t *)&new_reg[i], (uint64_t)old[i]);
-        }
-        if (z->old_count >= z->old_cap) {
-            uint32_t nc = z->old_cap ? z->old_cap * 2 : 4;
-            void **nl = (void **)a_alloc(nc * sizeof(void *));
-            if (nl) {
-                for (uint32_t i = 0; i < z->old_count; i++) {
-                    a_store64((uint64_t *)&nl[i], (uint64_t)z->old_arrays[i]);
-                }
-                free(z->old_arrays);
-                z->old_arrays = nl;
-                z->old_cap = nc;
-            }
-        }
-        if (z->old_arrays && z->old_count < z->old_cap)
-            z->old_arrays[z->old_count++] = old;
+        memcpy(new_reg, old, z->regions_cap * sizeof(idpool_region_base *));
+        old_arrays_push_locked(z, old);
     }
 
-    /* Release fence + atomic store: 确保所有槽位发布完, 再发布新数组指针 */
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    a_store64((uint64_t *)&z->regions_ptr, (uint64_t)new_reg);
-    a_store32(&z->regions_cap, new_cap);
+    /* 锁内发布:ptr 用 atomic store 以匹配 reader 的 atomic load (TSAN)
+     * 用 a_store64 + 显式 (uintptr_t) cast,与项目其他 ptr 字段发布一致 */
+    a_store64((uint64_t *)&z->regions_ptr, (uint64_t)(uintptr_t)new_reg);
+    __atomic_store_n(&z->regions_cap, new_cap, __ATOMIC_RELEASE);
 }
 
-/* 发布 Region 到动态 registry */
+/* old_arrays 列表追加旧数组指针 (供延迟释放用)
+ *
+ * 假定 grow_lock 已持有。
+ * 修复前: z->old_arrays[z->old_count++] = old 是非原子复合写,会 lost update
+ * 且 old_arrays 自身的扩容是双重 free / UAF 来源。
+ * 修复: 在锁内完成,单调递增可信任;old_arrays 自身的扩容也跑在同一锁内。
+ */
+static void old_arrays_push_locked(idpool_zone *z, void *old_ptr) {
+    if (!old_ptr) return;
+    if (z->old_count >= z->old_cap) {
+        uint32_t nc = z->old_cap ? z->old_cap * 2 : 4;
+        void **nl = (void **)a_alloc(nc * sizeof(void *));
+        if (!nl) abort();
+        if (z->old_arrays && z->old_count > 0)
+            memcpy(nl, z->old_arrays, z->old_count * sizeof(void *));
+        free(z->old_arrays);   /* 旧 old_arrays 容器立即回收,无需登记 */
+        z->old_arrays = nl;
+        z->old_cap = nc;
+    }
+    z->old_arrays[z->old_count++] = old_ptr;
+}
+
+/* 发布 Region 到动态 registry (取锁 + ensure + 单步写入)
+ *
+ * 锁定边界:
+ *   1. ensure 后 regions_ptr / regions_cap 一致,且 cap 必然 >= idx+1
+ *   2. 单步 a_store64 写入新槽位
+ *   3. 解锁
+ *
+ * 锁外 reader (zone_load_region) 通过 atomic load 看到一致快照,
+ * 即使在 ensure→store 期间被切换,reader 看到 cap=X 时 ptr 也是
+ * 容量 >= X 的正确数组。
+ */
 static void zone_publish_region(idpool_zone *z, uint32_t idx, idpool_region_base *r) {
-    zone_registry_ensure(z, idx);
-    a_store64((uint64_t *)&z->regions_ptr[idx], (uint64_t)r);
+    pthread_mutex_lock(&z->grow_lock);
+    zone_registry_ensure_locked(z, idx);
+    /* 锁内 regions_cap 单调非递减;idx 是本线程 CAS region_count 得到的独占值 */
+    z->regions_ptr[idx] = r;
+    pthread_mutex_unlock(&z->grow_lock);
+}
+
+/* 发布 Slot (取锁 + ensure + 写入)
+ *
+ * 同一锁内保证 slots / slots_cap 一致,槽位写入不会被并发 grow 替换覆盖。
+ */
+static void zone_slots_publish(idpool_zone *z, uint32_t idx, uint32_t ver) {
+    pthread_mutex_lock(&z->grow_lock);
+    zone_slots_ensure_locked(z, idx);
+    slot_publish(&z->slots[idx], idx, ver);
+    pthread_mutex_unlock(&z->grow_lock);
 }
 
 /* 加载 Region (处理扩容瞬态)
@@ -550,12 +572,13 @@ static idpool_region_base *create_region(idpool_zone *z) {
             r->region_idx = k;
 
             /* 3 步发布: registry → slots → global_bm
-             * 顺序很重要: 先 registry 才能 load_region, 再 slots 用于验证版本 */
+             * 顺序很重要: 先 registry 才能 load_region, 再 slots 用于验证版本
+             * zone_publish_region / zone_slots_publish 内部都取 grow_lock,
+             * publish 写入和 ensure 扩容在同一锁内原子完成。 */
             zone_publish_region(z, k, r);
 
-            zone_slots_ensure(z, k);
             uint32_t ver = k + 1;  /* 版本号: 每次发布 +1, 用于 ABA 检测 */
-            slot_publish(&z->slots[k], k, ver);
+            zone_slots_publish(z, k, ver);
 
             uint32_t gi = k >> 6, gb = k & 63;
             if (gi < GLOBAL_BMW)
@@ -594,7 +617,9 @@ static uint32_t region_alloc(idpool_zone *z, idpool_region_base *r,
 
     uint32_t cap = r->cap;
     uint32_t nw  = (cap + 63) >> 6;
-    uint64_t *bm = r->bitmap;
+    /* bitmap 由 ensure_region 用 atomic CAS 发布,这里也用 atomic load 配对
+     * (TSAN 严格要求两边都用 atomic,即便有 alloced 的 acquire fence 也不够) */
+    uint64_t *bm = (uint64_t *)__atomic_load_n(&r->bitmap, __ATOMIC_ACQUIRE);
     if (!bm) return FUN_IDPOOL_INVALID_ID;
 
     /* ---- Phase 0: 单调递增 ---- */
@@ -627,7 +652,8 @@ static uint32_t region_alloc(idpool_zone *z, idpool_region_base *r,
             if (z->mode == FUN_IDPOOL_MODE_WITH_VALUE) {
                 idpool_region *rw = (idpool_region *)r;
                 if (rw->values) {
-                    __atomic_store_n(&rw->values[bit], (uintptr_t)v,
+                    /* 显式转 void*:避免 clang -Wint-conversion (gcc 不报) */
+                    __atomic_store_n(&rw->values[bit], (void *)(uintptr_t)v,
                                      __ATOMIC_RELEASE);
                 }
             }
@@ -667,7 +693,8 @@ static uint32_t region_alloc(idpool_zone *z, idpool_region_base *r,
             if (z->mode == FUN_IDPOOL_MODE_WITH_VALUE) {
                 idpool_region *rw = (idpool_region *)r;
                 if (rw->values) {
-                    __atomic_store_n(&rw->values[bit], (uintptr_t)v,
+                    /* 显式转 void*:避免 clang -Wint-conversion (gcc 不报) */
+                    __atomic_store_n(&rw->values[bit], (void *)(uintptr_t)v,
                                      __ATOMIC_RELEASE);
                 }
             }
@@ -782,6 +809,12 @@ fun_idpool_t fun_idpool_create_ex(int numa_nodes, fun_idpool_mode_t mode) {
         z->zone_mask  = pool->zone_mask;
         z->mode       = (uint32_t)mode;
 
+        /* 初始化 grow_lock (默认属性;非递归;错误时直接 abort) */
+        if (pthread_mutex_init(&z->grow_lock, NULL) != 0) {
+            fprintf(stderr, "FATAL: pthread_mutex_init failed\n");
+            abort();
+        }
+
         /* Region #0: 立即创建并发布 */
         uint32_t cap0 = cap_of(0);
         idpool_region_base *r0;
@@ -799,10 +832,11 @@ fun_idpool_t fun_idpool_create_ex(int numa_nodes, fun_idpool_mode_t mode) {
         r0->zone_id = n;
         r0->region_idx = 0;
 
-        /* 初始化 slot 数组 */
-        zone_slots_ensure(z, 0);
+        /* 初始化 slot 数组 + 发布 Region #0
+         * init 阶段是单线程,zone_publish_region / zone_slots_publish 仍然
+         * 取 grow_lock (无竞争,但保证与运行时路径一致)。 */
         zone_publish_region(z, 0, r0);
-        slot_publish(&z->slots[0], 0, 1);
+        zone_slots_publish(z, 0, 1);
 
         z->region_count = 1;
         a_for64(&z->global_bm[0], 1ULL);
@@ -864,6 +898,10 @@ void fun_idpool_destroy(fun_idpool_t pool) {
                 if (z->old_arrays[i]) free(z->old_arrays[i]);
         }
         if (z->old_arrays)   free(z->old_arrays);
+
+        /* 销毁 grow_lock;destroy 是单线程独占,无需担心并发 */
+        pthread_mutex_destroy(&z->grow_lock);
+
         free(z);
     }
     free(pool);
@@ -948,8 +986,10 @@ void *fun_idpool_release_id(fun_idpool_t pool, uint32_t id) {
                     v = (void *)__atomic_load_n(
                         &((idpool_region *)r)->values[off],
                         __ATOMIC_ACQUIRE);
+                    /* 显式转 void*:避免 clang -Wint-conversion */
                     __atomic_store_n(
-                        &((idpool_region *)r)->values[off], (uintptr_t)NULL,
+                        &((idpool_region *)r)->values[off],
+                        (void *)(uintptr_t)NULL,
                         __ATOMIC_RELAXED);
                 }
                 bit_clear(r->bitmap, off);
